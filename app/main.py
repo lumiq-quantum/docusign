@@ -21,9 +21,9 @@ from .models import (
     SessionLocal, engine, get_db,
     Project, ProjectCreate, ProjectResponse,
     Document, DocumentCreate, DocumentResponse,
-    Page, PageCreate, PageResponse,
-    Stakeholder, StakeholderCreate, StakeholderResponse,
-    SignatureInstance, SignatureInstanceCreate, SignatureInstanceResponse, # Uncommented
+    Page, # PageCreate and PageResponse removed
+    Stakeholder, 
+    SignatureInstance, SignatureInstanceCreate, SignatureInstanceResponse,
     GeneratedHtmlResponse
 )
 
@@ -218,24 +218,6 @@ async def get_document_page_pdf(
         return Response(content=output_pdf_buffer.read(), media_type="application/pdf")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing PDF page: {str(e)}")
-
-# @app.get("/projects/{project_id}/pages/{page_number}/text", response_model=PageResponse)
-# This should now be:
-@app.get("/proposals/{proposal_id}/documents/{document_id}/pages/{page_number}/text", response_model=models.PageResponse)
-def get_document_page_text_content(
-    proposal_id: int,
-    document_id: int,
-    page_number: int,
-    db: Session = Depends(get_db)
-):
-    page = db.query(models.Page).join(models.Document).filter(
-        models.Document.project_id == proposal_id,
-        models.Page.document_id == document_id,
-        models.Page.page_number == page_number
-    ).first()
-    if not page:
-        raise HTTPException(status_code=404, detail="Page not found")
-    return page
 
 # Dynamic Digital Form System - Needs significant refactoring for new structure
 # The old /projects/{project_id}/pages/{page_number}/form/generate will become
@@ -465,121 +447,6 @@ async def get_signature_analysis_report(
 # If project-wide generation is still needed, it would loop through documents and call the per-document endpoint.
 # @app.get("/projects/generate-all-forms/", response_model=dict)
 # async def generate_all_forms_for_project(project_id: int, db: Session = Depends(get_db)):
-
-# --- Stakeholder Management ---
-@app.post("/proposals/{proposal_id}/stakeholders/", response_model=models.StakeholderResponse, status_code=201)
-def create_stakeholder_for_proposal(
-    proposal_id: int,
-    stakeholder_in: models.StakeholderCreate,
-    db: Session = Depends(get_db)
-):
-    """
-    Create a new stakeholder for a specific proposal.
-    The project_id in the stakeholder_in payload MUST match the proposal_id in the URL.
-    """
-    db_proposal = db.query(models.Project).filter(models.Project.id == proposal_id).first()
-    if not db_proposal:
-        raise HTTPException(status_code=404, detail=f"Proposal with id {proposal_id} not found")
-
-    # StakeholderCreate schema includes project_id. Validate it against the path.
-    if stakeholder_in.project_id != proposal_id:
-        raise HTTPException(
-            status_code=400,
-            detail=f"The project_id in the request body ({stakeholder_in.project_id}) must match the proposal_id in the URL path ({proposal_id})."
-        )
-
-    # Create the stakeholder instance using the validated name and the project_id from the path.
-    db_stakeholder = models.Stakeholder(name=stakeholder_in.name, project_id=proposal_id)
-    db.add(db_stakeholder)
-    db.commit()
-    db.refresh(db_stakeholder)
-    return db_stakeholder
-
-@app.get("/proposals/{proposal_id}/stakeholders/", response_model=List[models.StakeholderResponse])
-def list_stakeholders_for_proposal(
-    proposal_id: int,
-    db: Session = Depends(get_db)
-):
-    """
-    List all stakeholders associated with a specific proposal.
-    """
-    db_proposal = db.query(models.Project).filter(models.Project.id == proposal_id).first()
-    if not db_proposal:
-        raise HTTPException(status_code=404, detail=f"Proposal with id {proposal_id} not found")
-    
-    return db_proposal.stakeholders
-
-@app.get("/proposals/{proposal_id}/stakeholders/{stakeholder_id}/", response_model=models.StakeholderResponse)
-def get_stakeholder_for_proposal(
-    proposal_id: int,
-    stakeholder_id: int,
-    db: Session = Depends(get_db)
-):
-    """
-    Retrieve a specific stakeholder for a specific proposal.
-    """
-    db_stakeholder = db.query(models.Stakeholder).filter(
-        models.Stakeholder.id == stakeholder_id,
-        models.Stakeholder.project_id == proposal_id
-    ).first()
-    
-    if not db_stakeholder:
-        raise HTTPException(status_code=404, detail=f"Stakeholder with id {stakeholder_id} not found in proposal {proposal_id}")
-    return db_stakeholder
-
-@app.put("/proposals/{proposal_id}/stakeholders/{stakeholder_id}/", response_model=models.StakeholderResponse)
-def update_stakeholder_for_proposal(
-    proposal_id: int,
-    stakeholder_id: int,
-    stakeholder_in: models.StakeholderCreate, # Using Create schema for update. Name is the primary field to update.
-    db: Session = Depends(get_db)
-):
-    """
-    Update a stakeholder's details (primarily name) for a specific proposal.
-    The project_id of the stakeholder cannot be changed.
-    """
-    db_stakeholder = db.query(models.Stakeholder).filter(
-        models.Stakeholder.id == stakeholder_id,
-        models.Stakeholder.project_id == proposal_id
-    ).first()
-
-    if not db_stakeholder:
-        raise HTTPException(status_code=404, detail=f"Stakeholder with id {stakeholder_id} not found in proposal {proposal_id}")
-
-    # The StakeholderCreate schema has 'name' and 'project_id'.
-    # We only want to update 'name'. 'project_id' from payload must match existing.
-    if stakeholder_in.project_id != db_stakeholder.project_id:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot change the project_id of a stakeholder. Expected project_id {db_stakeholder.project_id} but got {stakeholder_in.project_id} in payload."
-        )
-
-    db_stakeholder.name = stakeholder_in.name
-    
-    db.commit()
-    db.refresh(db_stakeholder)
-    return db_stakeholder
-
-@app.delete("/proposals/{proposal_id}/stakeholders/{stakeholder_id}/", status_code=204)
-def delete_stakeholder_from_proposal(
-    proposal_id: int,
-    stakeholder_id: int,
-    db: Session = Depends(get_db)
-):
-    """
-    Delete a stakeholder from a specific proposal.
-    """
-    db_stakeholder = db.query(models.Stakeholder).filter(
-        models.Stakeholder.id == stakeholder_id,
-        models.Stakeholder.project_id == proposal_id
-    ).first()
-
-    if not db_stakeholder:
-        raise HTTPException(status_code=404, detail=f"Stakeholder with id {stakeholder_id} not found in proposal {proposal_id}")
-
-    db.delete(db_stakeholder)
-    db.commit()
-    return
 
 # --- AWS Textract Client ---
 # Configure your AWS region
@@ -877,47 +744,6 @@ def get_proposal(proposal_id: int, db: Session = Depends(get_db)):
     if not proposal:
         raise HTTPException(status_code=404, detail=f"Proposal with id {proposal_id} not found")
     return proposal
-
-# II. Document Management
-@app.get("/proposals/{proposal_id}/documents/{document_id}/", response_model=models.DocumentResponse)
-def get_document(
-    proposal_id: int,
-    document_id: int,
-    db: Session = Depends(get_db)
-):
-    """
-    Get details of a specific document within a proposal.
-    """
-    document = db.query(models.Document).filter(
-        models.Document.id == document_id,
-        models.Document.project_id == proposal_id
-    ).first()
-    
-    if not document:
-        raise HTTPException(status_code=404, detail=f"Document with id {document_id} in proposal {proposal_id} not found")
-    
-    return document
-
-# III. Page Management
-@app.get("/proposals/{proposal_id}/documents/{document_id}/pages/{page_number}/", response_model=models.PageResponse)
-def get_page(
-    proposal_id: int,
-    document_id: int,
-    page_number: int,
-    db: Session = Depends(get_db)
-):
-    """
-    Get a specific page of a document within a proposal.
-    """
-    page = db.query(models.Page).filter(
-        models.Page.document_id == document_id,
-        models.Page.page_number == page_number
-    ).first()
-
-    if not page:
-        raise HTTPException(status_code=404, detail=f"Page {page_number} not found in document {document_id} of proposal {proposal_id}")
-    
-    return page
 
 # --- Health Check Endpoint ---
 @app.get("/health/")

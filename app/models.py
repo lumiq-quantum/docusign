@@ -1,9 +1,10 @@
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, LargeBinary, Boolean, JSON
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.ext.declarative import declarative_base
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator # Updated import
 from datetime import datetime
 import os
+import json
 from typing import Optional, List # Added List
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5433/mydatabase")
@@ -99,8 +100,8 @@ class SignatureInstanceBase(BaseModel):
     stakeholder_id: Optional[int] = None
     ai_signature_id: Optional[str] = None
     ai_confidence: Optional[str] = None
-    bounding_box_json: Optional[dict] = None # Added
-    textract_response_json: Optional[dict] = None # Added
+    bounding_box_json: Optional[dict] = None 
+    textract_response_json: Optional[dict] = None
     # cropped_signature_image will not be directly in base/create, usually handled differently if sent via API
 
 class SignatureInstanceCreate(SignatureInstanceBase):
@@ -112,6 +113,17 @@ class SignatureInstanceResponse(SignatureInstanceBase):
     is_unique_among_stakeholders: Optional[bool] = None
     analysis_notes: Optional[str] = None
     # cropped_signature_image: Optional[bytes] = None # Decide if this should be sent in response; can be large
+
+    @field_validator('bounding_box_json', 'textract_response_json', mode='before')
+    @classmethod
+    def parse_json_fields(cls, value):
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                # Handle error or return value as is, depending on desired behavior
+                return None # Or raise an error, or return an empty dict
+        return value
 
     class Config:
         from_attributes = True
