@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Bac
 from sqlalchemy.orm import Session
 from typing import List, Dict # Added Dict
 import uuid # Added for generating application_number
+import random # Added for numerical application_number
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response # Added Response
 import boto3 # Added for AWS Textract
@@ -73,8 +74,14 @@ async def shutdown_event():
 
 # --- Helper Functions ---
 def generate_application_number() -> str:
-    """Generates a unique application number."""
-    return str(uuid.uuid4())
+    """Generates a unique 10-digit numerical application number starting with 1."""
+    # Generate a 9-digit random number
+    random_digits = random.randint(0, 999999999)
+    # Format it as a 9-digit string, padding with leading zeros if necessary
+    nine_digits = str(random_digits).zfill(9)
+    # Prepend '1' to make it a 10-digit number starting with 1
+    application_number = "1" + nine_digits
+    return application_number
 
 # --- API Endpoints ---
 
