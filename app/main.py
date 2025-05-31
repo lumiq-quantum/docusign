@@ -68,6 +68,9 @@ except Exception as e:
 # HTTP client for calling external services
 http_client = httpx.AsyncClient()
 
+CHAT_API_URL = os.getenv("CHAT_API_URL", "http://localhost:8090/chat/new") # Added
+CHAT_MESSAGE_API_URL_TEMPLATE = os.getenv("CHAT_MESSAGE_API_URL_TEMPLATE", "http://localhost:8090/chat/{session_id}/message") # Added
+
 @app.on_event("shutdown")
 async def shutdown_event():
     await http_client.aclose()
@@ -94,16 +97,31 @@ async def create_proposal(
     """
     Create a new proposal (project).
     An application_number will be automatically generated.
+    A chat session will be created for the proposal.
     """
     application_number = generate_application_number()
     # Ensure uniqueness, though UUIDs are highly unlikely to collide
     while db.query(models.Project).filter(models.Project.application_number == application_number).first():
         application_number = generate_application_number()
 
+    chat_session_id = None
+    try:
+        response = await http_client.post(CHAT_API_URL)
+        response.raise_for_status() # Raise an exception for bad status codes
+        chat_session_id = response.json().get("id") # Assuming the API returns { "session_id": "..." }
+    except httpx.RequestError as e:
+        print(f"Error creating chat session for new proposal: {e}")
+        # Decide if this should be a fatal error or if proposal can be created without it
+        # For now, let's allow creation without it, but log the error.
+        pass # Or raise HTTPException
+    except Exception as e:
+        print(f"An unexpected error occurred when creating chat session: {e}")
+        pass
+
     db_project = models.Project(
         name=project_in.name,
         application_number=application_number,
-        chat_session_id=project_in.chat_session_id # If provided
+        chat_session_id=chat_session_id # Store the new session ID
     )
     db.add(db_project)
     db.commit()
@@ -132,6 +150,19 @@ async def upload_documents_to_proposal(
         pdf_content = await file.read()
         file_name = file.filename
 
+        chat_session_id_doc = None
+        try:
+            response = await http_client.post(CHAT_API_URL)
+            response.raise_for_status()
+            chat_session_id_doc = response.json().get("id")
+        except httpx.RequestError as e:
+            print(f"Error creating chat session for document {file_name}: {e}")
+            # Decide if this should be a fatal error or if document can be created without it
+            pass
+        except Exception as e:
+            print(f"An unexpected error occurred when creating chat session for document {file_name}: {e}")
+            pass
+
         try:
             pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
             num_pages = len(pdf_reader.pages)
@@ -140,11 +171,56 @@ async def upload_documents_to_proposal(
                 file_name=file_name,
                 pdf_file=pdf_content,
                 total_pages=num_pages,
-                project_id=db_proposal.id
+                project_id=db_proposal.id,
+                chat_session_id=chat_session_id_doc # Store the new session ID
             )
             db.add(db_document)
             db.commit() # Commit per document to get its ID for pages
             db.refresh(db_document)
+
+            # Add document to its own chat session
+            if db_document.chat_session_id:
+                try:
+                    pdf_content_for_upload_doc_session = io.BytesIO(pdf_content)
+                    message_payload_doc_session = {"message": f"Context for document '{db_document.file_name}' (ID: {db_document.id})."}
+                    doc_session_message_url = CHAT_MESSAGE_API_URL_TEMPLATE.format(session_id=db_document.chat_session_id)
+                    
+                    response_doc_chat = await http_client.post(
+                        doc_session_message_url,
+                        files={'file': (db_document.file_name, pdf_content_for_upload_doc_session, 'application/pdf')},
+                        data=message_payload_doc_session
+                    )
+                    response_doc_chat.raise_for_status()
+                    print(f"Successfully sent document {db_document.file_name} to its own chat session {db_document.chat_session_id}")
+                except httpx.RequestError as exc:
+                    print(f"Error sending PDF to document's chat session {db_document.chat_session_id}: {exc}")
+                except httpx.HTTPStatusError as exc:
+                    print(f"Chat service error for document's session {db_document.chat_session_id} during PDF upload: {exc.response.status_code} - {exc.response.text}")
+                except Exception as e:
+                    print(f"Unexpected error during PDF upload to document's chat session {db_document.chat_session_id}: {str(e)}")
+
+            # Add document to proposal's chat session
+            if db_proposal.chat_session_id:
+                try:
+                    pdf_content_for_upload_proposal_session = io.BytesIO(pdf_content)
+                    message_payload_proposal_session = {
+                        "message": f"New document '{db_document.file_name}' (ID: {db_document.id}) added to proposal '{db_proposal.name}' (ID: {db_proposal.id})."
+                    }
+                    proposal_session_message_url = CHAT_MESSAGE_API_URL_TEMPLATE.format(session_id=db_proposal.chat_session_id)
+
+                    response_proposal_chat = await http_client.post(
+                        proposal_session_message_url,
+                        files={'file': (db_document.file_name, pdf_content_for_upload_proposal_session, 'application/pdf')},
+                        data=message_payload_proposal_session
+                    )
+                    response_proposal_chat.raise_for_status()
+                    print(f"Successfully sent document {db_document.file_name} to proposal's chat session {db_proposal.chat_session_id}")
+                except httpx.RequestError as exc:
+                    print(f"Error sending PDF to proposal's chat session {db_proposal.chat_session_id}: {exc}")
+                except httpx.HTTPStatusError as exc:
+                    print(f"Chat service error for proposal's session {db_proposal.chat_session_id} during PDF upload: {exc.response.status_code} - {exc.response.text}")
+                except Exception as e:
+                    print(f"Unexpected error during PDF upload to proposal's chat session {db_proposal.chat_session_id}: {str(e)}")
 
             # Extract text and create page entries for this document
             for i in range(num_pages):

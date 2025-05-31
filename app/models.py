@@ -34,7 +34,8 @@ class Document(Base):
     pdf_file = Column(LargeBinary, nullable=False)
     total_pages = Column(Integer, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-    
+    chat_session_id = Column(String, nullable=True) # Added
+
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
     project = relationship("Project", back_populates="documents")
     
@@ -162,6 +163,7 @@ class PageResponse(PageBase):
 class DocumentBase(BaseModel):
     file_name: str
     total_pages: int
+    chat_session_id: Optional[str] = None # Added
 
 class DocumentCreate(DocumentBase):
     # pdf_file will be handled via UploadFile in endpoint
