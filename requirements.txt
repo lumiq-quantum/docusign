@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary  # Or your preferred database driver
+alembic
+pydantic[email]
+python-multipart  # For file uploads
+PyPDF2  # For PDF processing
+passlib[bcrypt] # For password hashing
+python-jose[cryptography] # For JWT tokens
+google-generativeai
+httpx
+# google-genai # google-generativeai is the preferred library
+boto3 # For AWS Textract
+pdf2image # For PDF to image conversion (requires poppler)
+PyPDF2
