@@ -1,0 +1,134 @@
+{
+  "reportGeneratedDate": "May 30, 2024, 10:00 AM",
+  "overallSummary": {
+    "documentsAnalyzedCount": 2,
+    "documentsAnalyzedNames": ["A form 2.pdf", "B form 2.pdf"],
+    "stakeholdersIdentifiedCount": 3,
+    "stakeholdersIdentifiedNamesShort": ["W. W. HENG", "C. T. MAN", "C. S. MAIN"],
+    "overallStatusText": "All Verified",
+    "overallStatusDescription": "Signatures are consistent and unique."
+  },
+  "detailedStakeholderAnalysis": [
+    {
+      "id": "stakeholder1",
+      "fullName": "WONG WANG HENG",
+      "roles": "Policyholder, Proposed Insured, Account Holder",
+      "verificationStatus": "Verified",
+      "signatureInstances": [
+        {
+          "id": "sig1",
+          "placeholderId": "Placeholder Sig 1",
+          "documentName": "A form 2.pdf",
+          "roleInDocument": "Proposed Insured",
+          "signatureImageUrl": null
+        },
+        {
+          "id": "sig2",
+          "placeholderId": "Placeholder Sig 2",
+          "documentName": "A form 2.pdf",
+          "roleInDocument": "Policyholder",
+          "signatureImageUrl": null
+        },
+        {
+          "id": "sig3",
+          "placeholderId": "Placeholder Sig 3",
+          "documentName": "B form 2.pdf",
+          "roleInDocument": "Proposed Insured",
+          "signatureImageUrl": null
+        },
+        {
+          "id": "sig4",
+          "placeholderId": "Placeholder Sig 4",
+          "documentName": "B form 2.pdf",
+          "roleInDocument": "Account Holder",
+          "signatureImageUrl": null
+        }
+      ],
+      "analysisResults": {
+        "intraStakeholderConsistency": {
+          "status": "Match",
+          "details": "All signatures are consistent. Confidence: 98.2%"
+        },
+        "interStakeholderUniqueness": {
+          "status": "Unique",
+          "details": "Signatures do not match other stakeholders."
+        }
+      }
+    },
+    {
+      "id": "stakeholder2",
+      "fullName": "CHAN TAI MAN",
+      "roles": "Account Holder (Subsequent Premium)",
+      "verificationStatus": "Verified",
+      "signatureInstances": [
+        {
+          "id": "sig5",
+          "placeholderId": "Placeholder Sig 5",
+          "documentName": "B form 2.pdf",
+          "roleInDocument": "Account Holder (Subsequent)",
+          "signatureImageUrl": null
+        }
+      ],
+      "analysisResults": {
+        "intraStakeholderConsistency": {
+          "status": "N/A",
+          "details": "Only one signature instance found."
+        },
+        "interStakeholderUniqueness": {
+          "status": "Unique",
+          "details": "Signature does not match other stakeholders."
+        }
+      }
+    },
+    {
+      "id": "stakeholder3",
+      "fullName": "CHAN SIU MAIN",
+      "roles": "Joint Account Holder (Subsequent Premium)",
+      "verificationStatus": "Verified",
+      "signatureInstances": [
+        {
+          "id": "sig6",
+          "placeholderId": "Placeholder Sig 6",
+          "documentName": "B form 2.pdf",
+          "roleInDocument": "Joint Account Holder",
+          "signatureImageUrl": null
+        }
+      ],
+      "analysisResults": {
+        "intraStakeholderConsistency": {
+          "status": "N/A",
+          "details": "Only one signature instance found."
+        },
+        "interStakeholderUniqueness": {
+          "status": "Unique",
+          "details": "Signature does not match other stakeholders."
+        }
+      }
+    }
+  ],
+  "crossStakeholderVerification": [
+    {
+      "pairId": "pair1",
+      "stakeholderPair": "WONG WANG HENG vs. CHAN TAI MAN",
+      "comparisonResult": "Signatures are distinct.",
+      "status": "Unique"
+    },
+    {
+      "pairId": "pair2",
+      "stakeholderPair": "WONG WANG HENG vs. CHAN SIU MAIN",
+      "comparisonResult": "Signatures are distinct.",
+      "status": "Unique"
+    },
+    {
+      "pairId": "pair3",
+      "stakeholderPair": "CHAN TAI MAN vs. CHAN SIU MAIN",
+      "comparisonResult": "Signatures are distinct.",
+      "status": "Unique"
+    }
+  ],
+  "reportFooter": {
+    "copyrightYear": 2024,
+    "companyName": "Signature Verification System",
+    "disclaimer": "This report is based on automated analysis and should be used for informational purposes. Manual verification is recommended for critical applications."
+  }
+}

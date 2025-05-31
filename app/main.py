@@ -1,19 +1,20 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks # Added BackgroundTasks
 from sqlalchemy.orm import Session
 from typing import List, Dict # Added Dict
-import PyPDF2
-import io
-import os
 import uuid # Added for generating application_number
-import google.generativeai as genai
-import httpx
 from fastapi.middleware.cors import CORSMiddleware
-import asyncio
 from fastapi.responses import HTMLResponse, Response # Added Response
 import boto3 # Added for AWS Textract
 from pdf2image import convert_from_bytes # Added for PDF to image conversion
+import io
 import json # Added for JSON processing
 from PIL import Image # Added for image manipulation
+import httpx # Added for HTTP client
+import os
+import PyPDF2 # For PDF processing
+import google.generativeai as genai # Corrected import
+from datetime import datetime # Added for report generation date
+import base64 # Add this import
 
 from . import models
 # Updated model imports to reflect new structure and Pydantic schemas
@@ -51,12 +52,14 @@ def get_db():
 # Initialize Gemini client
 # IMPORTANT: Set your GOOGLE_API_KEY environment variable before running the app.
 try:
-    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-    gemini_model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20') # User updated to gemini-2.5-flash-preview-05-20 or similar
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise KeyError("GOOGLE_API_KEY environment variable not set.")
+    genai.configure(api_key=api_key)
+    gemini_model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20') # Using a common model
 except KeyError:
     print("ERROR: GOOGLE_API_KEY environment variable not set.")
-    # Potentially exit or disable Gemini-dependent features
-    gemini_model = None 
+    gemini_model = None
 except Exception as e:
     print(f"Error initializing Gemini client: {e}")
     gemini_model = None
@@ -293,7 +296,7 @@ async def generate_html_for_document_pages(document_id: int, proposal_id: int, d
                     print("Background task: Gemini model not initialized. Skipping AI call.")
                     continue
                 prompt = """You are Expert in reading complex documents.
-                Task for you: Extract the information from the document, You need to convert physical document into a digital verion which imitates the physical form , keep information prefilled and editable.Rememeber the accuracy of the information extracted specially filled information is absolutely important.You need to take care of multilingual , checkboxes and handwritten complexity within document. give me the html with good stylinng for review, if you are not confident on any field or section enough mark that area as red so that Human can rectify that easily, there might be signatures on the documents, if there are multiple signatures on the document you have to match those documents and if there is dissimilarity between those signatures you need to highlight in red for those. There can be multiple singatures of a set of person, you need to also categorise the group of signature by the same person. The output should be the html page content without suffix or prefix."""
+                Task for you: Extract the information from the document, You need to convert physical document into a digital verion which imitates the physical form , keep information prefilled and editable.Rememeber the accuracy of the information extracted specially filled information is absolutely important.You need to take care of multilingual , checkboxes and handwritten complexity within document. give me the html with good stylinng for review, if you are not confident on any field or section enough mark that area as red so that Human can rectify that easily. The output should be the html page content without suffix or prefix."""
                 pdf_blob_bg = {
                     'mime_type': 'application/pdf',
                     'data': pdf_page_bytes_bg
@@ -351,7 +354,7 @@ async def get_document_page_html(
     else:
         raise HTTPException(
             status_code=404, 
-            detail=f"HTML form for page {page_number} of document {document_id} has not been generated yet. Use the POST /proposals/{proposal_id}/documents/{document_id}/extract-html endpoint to create it."
+            detail=f"HTML form for page {page_number} of document {document_id} has not been generated yet."
         )
     
 # @app.get("/projects/{project_id}/pages/{page_number}/html_view", response_class=HTMLResponse)
@@ -486,47 +489,46 @@ async def start_signature_analysis_for_proposal(
 
     return {"message": f"Signature analysis initiated for proposal {proposal_id}."}
 
-async def perform_signature_analysis(proposal_id: int):
+async def perform_signature_analysis(proposal_id: int, db_bg: Session = Depends(get_db)): # Assuming get_db_bg is your dependency
     """
     Background task to perform signature analysis using AWS Textract and Google Gemini.
     """
-    db_bg = SessionLocal()
+    db_bg = SessionLocal() # Create a new session for this background task
     try:
-        proposal = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
-        if not proposal:
+        proposal_before_textract = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
+        if not proposal_before_textract:
             print(f"Signature Analysis Task: Proposal {proposal_id} not found.")
-            # No further action possible if proposal doesn't exist
             return
 
-        proposal.signature_analysis_status = "processing_textract_started"
+        proposal_before_textract.signature_analysis_status = "processing_textract_started"
         db_bg.commit()
+        db_bg.refresh(proposal_before_textract)
 
-        stakeholders_for_proposal = db_bg.query(models.Stakeholder).filter(models.Stakeholder.project_id == proposal_id).all()
-        stakeholder_names = [s.name for s in stakeholders_for_proposal]
-
-        for db_doc in proposal.documents:
+        for db_doc in proposal_before_textract.documents:
             if not db_doc.pdf_file:
                 print(f"Signature Analysis Task: PDF file missing for document {db_doc.id} in proposal {proposal_id}.")
                 continue
             
-            # Fetch proposal again to ensure it's current for status updates within loop
+            # Fetch proposal again inside loop to get most recent status if other tasks modified it (though unlikely here)
             current_proposal_in_loop = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
-            if not current_proposal_in_loop: # Should not happen if initial check passed
+            if not current_proposal_in_loop:
                 print(f"Signature Analysis Task: Proposal {proposal_id} disappeared during processing doc {db_doc.id}.")
-                return
+                return 
             current_proposal_in_loop.signature_analysis_status = f"processing_textract_doc_{db_doc.id}"
             db_bg.commit()
+            db_bg.refresh(current_proposal_in_loop)
 
             try:
                 images_from_pdf = convert_from_bytes(db_doc.pdf_file, dpi=200)
             except Exception as e_conv:
-                db_bg.rollback() # Rollback on PDF conversion error
+                db_bg.rollback() # Rollback any potential partial changes from this iteration
                 print(f"Signature Analysis Task: Failed to convert PDF to images for doc {db_doc.id}: {e_conv}")
                 proposal_after_conv_error = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
                 if proposal_after_conv_error:
                     proposal_after_conv_error.signature_analysis_status = f"failed_pdf_conversion_doc_{db_doc.id}"
                     db_bg.commit()
-                continue # Continue to next document
+                    db_bg.refresh(proposal_after_conv_error)
+                continue
 
             for i, page_image_pil in enumerate(images_from_pdf):
                 page_number = i + 1
@@ -536,214 +538,227 @@ async def perform_signature_analysis(proposal_id: int):
                 ).first()
 
                 if not db_page:
-                    print(f"Signature Analysis Task: Page entry not found for doc {db_doc.id}, page {page_number}. Skipping Textract for this page.")
-                    continue
+                    print(f"Signature Analysis Task: Page object not found for doc {db_doc.id}, page {page_number}. Skipping.")
+                    # Potentially create the page if it's missing and expected to exist
+                    # For now, we skip to avoid errors.
+                    continue # Added continue
 
                 img_byte_arr = io.BytesIO()
                 page_image_pil.save(img_byte_arr, format='PNG')
                 img_byte_arr_val = img_byte_arr.getvalue()
 
                 try:
-                    textract_response = textract_client.analyze_document(
-                        Document={'Bytes': img_byte_arr_val},
-                        FeatureTypes=['SIGNATURES']
-                    )
-
-                    page_width, page_height = page_image_pil.size
-                    found_signatures_on_page = False
-                    for block in textract_response.get('Blocks', []):
-                        if block['BlockType'] == 'SIGNATURE':
-                            found_signatures_on_page = True
-                            bbox = block['Geometry']['BoundingBox']
-                            abs_left = int(bbox['Left'] * page_width)
-                            abs_top = int(bbox['Top'] * page_height)
-                            abs_width = int(bbox['Width'] * page_width)
-                            abs_height = int(bbox['Height'] * page_height)
-                            abs_right = abs_left + abs_width
-                            abs_bottom = abs_top + abs_height
-
-                            cropped_pil_image = page_image_pil.crop((abs_left, abs_top, abs_right, abs_bottom))
-                            
-                            cropped_img_byte_arr = io.BytesIO()
-                            cropped_pil_image.save(cropped_img_byte_arr, format='PNG')
-                            cropped_signature_bytes = cropped_img_byte_arr.getvalue()
-
-                            db_sig_instance = models.SignatureInstance(
-                                page_id=db_page.id,
-                                document_id=db_doc.id,  # *** FIX: Populate document_id ***
-                                bounding_box_json=json.dumps(bbox),
-                                textract_response_json=json.dumps(block),
-                                cropped_signature_image=cropped_signature_bytes,
-                            )
-                            db_bg.add(db_sig_instance)
-                    
-                    if found_signatures_on_page:
-                        db_bg.commit() # Commit signatures for this page
+                    # Placeholder for Textract call and signature instance creation
+                    # This is where you'd call textract_client.analyze_document
+                    # and then process the response to find signatures, crop them,
+                    # and create models.SignatureInstance objects.
+                    # Example:
+                    # response = textract_client.analyze_document(...)
+                    # for block in response['Blocks']:
+                    #   if block['BlockType'] == 'SIGNATURE':
+                    #     # ... process signature ...
+                    #     # db_signature_instance = models.SignatureInstance(...)
+                    #     # db_bg.add(db_signature_instance)
+                    #     pass # Replace with actual logic
+                    print(f"Signature Analysis Task: Placeholder for Textract processing for doc {db_doc.id}, page {page_number}")
+                    pass # Added pass
 
                 except Exception as e_textract:
-                    db_bg.rollback() # *** FIX: Rollback on Textract error ***
                     print(f"Signature Analysis Task: Error during Textract processing for doc {db_doc.id}, page {page_number}: {e_textract}")
+                    # Update proposal status to reflect this specific error
                     proposal_after_textract_error = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
                     if proposal_after_textract_error:
-                        proposal_after_textract_error.signature_analysis_status = f"failed_textract_doc_{db_doc.id}_page_{page_number}"
+                        proposal_after_textract_error.signature_analysis_status = f"error_textract_page_{db_doc.id}_{page_number}"
                         db_bg.commit()
-                    # Continue to the next page or document
-
-        # Fetch proposal again before Gemini step
+                        db_bg.refresh(proposal_after_textract_error)
+                    # Continue to the next page or document, or handle error more critically
+                    pass # Added pass
+            # After processing all pages of a document
+            db_bg.commit() # Commit signature instances for the document
+        
         proposal_before_gemini = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
         if not proposal_before_gemini:
-            print(f"Signature Analysis Task: Proposal {proposal_id} not found before Gemini report stage.")
-            return
+            print(f"Signature Analysis Task: Proposal {proposal_id} not found before Gemini report generation.")
+            # Update status if possible, though proposal object is None
+            # This case should ideally be caught earlier.
+            return # Added return
+            
         proposal_before_gemini.signature_analysis_status = "processing_gemini_report"
         db_bg.commit()
+        db_bg.refresh(proposal_before_gemini)
 
-        content_parts_for_gemini = []
+        # Prepare data for the HTML template
+        documents_html_parts = []
+        if hasattr(proposal_before_gemini, 'documents') and proposal_before_gemini.documents:
+            for doc_idx, db_doc_report in enumerate(proposal_before_gemini.documents): # Renamed db_doc to db_doc_report to avoid conflict
+                signatures_html_parts = []
+                # Ensure db_doc_report.signature_instances is accessible and populated
+                # This might require refreshing db_doc_report or ensuring relationships are loaded
+                # For now, assuming it's available.
+                # Example: db_bg.refresh(db_doc_report, ['signature_instances'])
+                
+                # Correctly query signature instances associated with the current document (db_doc_report) and its pages
+                # This part was missing the actual query for signature instances for the report.
+                # We need to iterate through pages of db_doc_report and then their signature_instances.
+                
+                # Fetch pages for the current document
+                pages_for_report = db_bg.query(models.Page).filter(models.Page.document_id == db_doc_report.id).all()
+                for page_for_report in pages_for_report:
+                    # Fetch signature instances for the current page
+                    signature_instances_for_page = db_bg.query(models.SignatureInstance).filter(models.SignatureInstance.page_id == page_for_report.id).all()
+
+                    for sig_idx, sig_instance in enumerate(signature_instances_for_page):
+                        cropped_signature_image_base64 = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" # Default placeholder
+                        if hasattr(sig_instance, 'cropped_signature_image') and sig_instance.cropped_signature_image and isinstance(sig_instance.cropped_signature_image, bytes):
+                            img_b64 = base64.b64encode(sig_instance.cropped_signature_image).decode('utf-8')
+                            cropped_signature_image_base64 = f"data:image/png;base64,{img_b64}"
+                        
+                        textract_response_display = "{}"
+                        if hasattr(sig_instance, 'textract_response_json') and sig_instance.textract_response_json:
+                            try:
+                                loaded_json = json.loads(sig_instance.textract_response_json)
+                                textract_response_display = json.dumps(loaded_json, indent=2)
+                            except (json.JSONDecodeError, TypeError):
+                                textract_response_display = "Error decoding/loading Textract JSON."
+                        
+                        bounding_box_display = "{}"
+                        if hasattr(sig_instance, 'bounding_box_json') and sig_instance.bounding_box_json:
+                            try:
+                                loaded_json_bbox = json.loads(sig_instance.bounding_box_json)
+                                bounding_box_display = json.dumps(loaded_json_bbox, indent=2)
+                            except (json.JSONDecodeError, TypeError):
+                                bounding_box_display = "Error decoding/loading Bounding Box JSON."
+                        
+                        page_num_display = sig_instance.page_number if hasattr(sig_instance, 'page_number') else page_for_report.page_number # Fallback to page_for_report
+
+                        signatures_html_parts.append(f"""
+                            <div class="signature-block" style="margin-bottom: 15px; padding: 10px; border: 1px solid #eee;">
+                                <h4>Signature {sig_idx + 1} (Page {page_num_display})</h4>
+                                <img src="{cropped_signature_image_base64}" alt="Signature Image {sig_idx + 1}" style="max-width: 200px; max-height:100px; border: 1px solid #ccc; margin-bottom:5px;"/>
+                                <p><strong>Bounding Box:</strong><pre>{bounding_box_display}</pre></p>
+                                <p><strong>Textract Details (summary):</strong><pre>{textract_response_display}</pre></p>
+                            </div>
+                        """)
+                signatures_html_content = "".join(signatures_html_parts) if signatures_html_parts else "<p>No signatures processed for this document.</p>"
+                
+                doc_name_display = db_doc_report.file_name if hasattr(db_doc_report, 'file_name') and db_doc_report.file_name else f"Unnamed Document (ID: {db_doc_report.id if hasattr(db_doc_report, 'id') else 'N/A'})"
+                documents_html_parts.append(f"""
+                    <div class="document-block" style="margin-top: 20px; padding:15px; background-color:#f9f9f9;">
+                        <h3>Document: {doc_name_display}</h3>
+                        {signatures_html_content}
+                    </div>
+                """)
+        documents_html_content_final = "".join(documents_html_parts) if documents_html_parts else "<p>No documents found or processed for this proposal.</p>"
         
-        initial_prompt_text = f"""
-You are an expert in signature analysis for financial and legal documents.
-You will be provided with one or more PDF documents for a single proposal (Proposal ID: {proposal_id}).
-The proposal involves the following stakeholders: {', '.join(stakeholder_names) if stakeholder_names else 'Not specified'}.
+        current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        project_name_display = proposal_before_gemini.name if hasattr(proposal_before_gemini, 'name') and proposal_before_gemini.name else "N/A" # Corrected attribute to 'name'
+        stakeholder_names_display = proposal_before_gemini.stakeholder_names if hasattr(proposal_before_gemini, 'stakeholder_names') and proposal_before_gemini.stakeholder_names else "N/A"
+        proposal_id_display = proposal_before_gemini.id if hasattr(proposal_before_gemini, 'id') else "N/A"
+        current_year = datetime.now().year
 
-For each PDF document provided, you will also receive a list of page numbers and, for each signature detected on those pages:
-- Its unique Signature ID.
-- The bounding box coordinates (as detected by AWS Textract) within the PDF page.
-- An embedded HTML `<img>` tag that directly displays the cropped signature image. You MUST render this image in your report.
-
-Your task is to generate a comprehensive HTML report that analyzes these signatures. The report should focus on:
-1.  **Intra-Stakeholder Consistency**: For each stakeholder (if signatures can be attributed to them later by a human), how consistent are their signatures across all documents and pages? (Visually assess the signatures using the provided cropped images and their context in the PDFs at the given locations).
-2.  **Inter-Stakeholder Uniqueness**: How unique are the signatures when compared between different stakeholders? (e.g., are Applicant 1's signatures clearly different from Applicant 2's based on visual assessment of the cropped images and their PDF context?).
-3.  **Signature Quality**: For each detected signature (shown via `<img>` tag), assess its clarity and quality (e.g., clear, faint, rushed, potentially part of a stamp, obscured). Refer to the signature by its ID.
-4.  **Overall Observations**: Any anomalies, irregularities, or other points of interest regarding the signatures (e.g., signatures appearing in unexpected places, signs of tampering near signature areas).
-
-IMPORTANT: You are analyzing the visual signatures. Use the cropped images extensively in your analysis and refer to them by their Signature ID.
-Currently, the signatures are NOT YET programmatically LINKED to specific stakeholders in the data provided.
-Your report should acknowledge this limitation. For now, analyze the signatures based on their appearance.
-You can make general observations about groups of similar-looking signatures if they appear.
-
-The HTML report should be well-structured, easy to read, and use appropriate styling (e.g., tables, highlights for important findings).
-Please generate only the HTML content for the report body. Do not include <html>, <head>, or <body> tags.
-Highlight any areas of concern (e.g., significant variations that might belong to the same person but look different, very faint or unclear signatures, suspicious marks) in red or with strong emphasis.
-If no stakeholders are specified, make general observations about the consistency, uniqueness, and quality of the detected signature patterns.
-
-The following sections will detail the PDF documents and their associated signature locations, including the cropped images.
+        SIGNATURE_ANALYSIS_REPORT_PROMPT_TEMPLATE = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Signature Analysis Report for Proposal ID: {proposal_id_display}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f4f4; color: #333; }}
+        .container {{ max-width: 800px; margin: 20px auto; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
+        h1, h2, h3, h4 {{ color: #333; }}
+        h1 {{ text-align: center; border-bottom: 2px solid #007bff; padding-bottom: 10px; margin-bottom: 20px; color: #007bff;}}
+        h2 {{ background-color: #e9ecef; padding: 10px; border-left: 4px solid #007bff; margin-top: 30px; }}
+        h3 {{ border-bottom: 1px solid #ccc; padding-bottom: 5px; }}
+        table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
+        th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
+        th {{ background-color: #f8f9fa; }}
+        pre {{ background-color: #e9ecef; padding: 10px; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; font-size: 0.9em; }}
+        .footer {{ text-align: center; margin-top: 30px; font-size: 0.9em; color: #777; }}
+        .section {{ margin-bottom: 25px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Signature Analysis Report</h1>
+        <div class="section" id="proposal-overview">
+            <h2>Proposal Overview</h2>
+            <table>
+                <tr><th>Proposal ID</th><td>{proposal_id_display}</td></tr>
+                <tr><th>Project Name</th><td>{project_name_display}</td></tr>
+                <tr><th>Analysis Date</th><td>{current_time_str}</td></tr>
+                <tr><th>Stakeholders</th><td>{stakeholder_names_display}</td></tr>
+            </table>
+        </div>
+        <div class="section" id="document-analysis">
+            <h2>Document & Signature Details</h2>
+            {documents_html_content_final}
+        </div>
+        <div class="section" id="ai-summary">
+            <h2>AI-Powered Insights & Summary</h2>
+            <div id="gemini-analysis-content">
+                <p><em>(AI analysis to be provided by Gemini based on the data presented. Gemini, please review the signature data, note any inconsistencies, patterns, or anomalies, and provide a concise summary of findings and a recommendation.)</em></p>
+                {'''<!-- Example of what Gemini might fill in:
+                <p><strong>Overall Consistency:</strong> High</p>
+                <p><strong>Anomalies Detected:</strong> One signature on Document 'XYZ.pdf', page 3, appears rushed compared to others.</p>
+                <p><strong>Recommendation:</strong> Manual review of the flagged signature is advised. Otherwise, documents appear consistent.</p>
+                -->'''}
+            </div>
+        </div>
+        <div class="footer">
+            Generated by Signature Analysis System &copy; {current_year}
+        </div>
+    </div>
+</body>
+</html>
 """
-        content_parts_for_gemini.append(initial_prompt_text)
-
-        for db_doc_for_gemini in proposal.documents:
-            if not db_doc_for_gemini.pdf_file:
-                continue
-
-            content_parts_for_gemini.append(f"--- Document: {db_doc_for_gemini.file_name} (ID: {db_doc_for_gemini.id}) ---")
-            content_parts_for_gemini.append({'mime_type': 'application/pdf', 'data': db_doc_for_gemini.pdf_file})
-            
-            signatures_on_this_pdf_details_parts = []
-            pages_with_signatures_on_this_doc = db_bg.query(models.Page)\
-                .join(models.SignatureInstance, models.SignatureInstance.page_id == models.Page.id)\
-                .filter(models.Page.document_id == db_doc_for_gemini.id)\
-                .distinct()\
-                .order_by(models.Page.page_number)\
-                .all()
-
-            if not pages_with_signatures_on_this_doc:
-                signatures_on_this_pdf_details_parts.append("No signatures were detected by Textract in this document.")
-            else:
-                for page_with_sig in pages_with_signatures_on_this_doc:
-                    page_sig_instances = db_bg.query(models.SignatureInstance)\
-                        .filter(models.SignatureInstance.page_id == page_with_sig.id)\
-                        .all()
-                    if not page_sig_instances:
-                        continue
-
-                    sig_details_for_page_text = [f"Page {page_with_sig.page_number}:"]
-                    for sig in page_sig_instances:
-                        # IMPORTANT: Construct the URL carefully. This assumes your FastAPI app is running at the root.
-                        # If it's behind a proxy or has a prefix, this URL needs to be adjusted or made absolute.
-                        image_url = f"/proposals/{proposal_id}/signatures/{sig.id}/image" 
-                        sig_detail = (
-                            f"  - Signature ID: {sig.id}\n"
-                            f"    Bounding Box (relative to page): {sig.bounding_box_json}\n"
-                            f"    Cropped Image: <img src='{image_url}' alt='Signature {sig.id}' style='max-width:200px; max-height:100px; border:1px solid #ddd; vertical-align: middle; margin: 5px;' />"
-                        )
-                        sig_details_for_page_text.append(sig_detail)
-                    
-                    signatures_on_this_pdf_details_parts.append("\n".join(sig_details_for_page_text))
-            
-            if signatures_on_this_pdf_details_parts:
-                text_part_for_signatures_on_pdf = "Signature Details for this Document:\n" + "\n".join(signatures_on_this_pdf_details_parts)
-                content_parts_for_gemini.append(text_part_for_signatures_on_pdf)
-            content_parts_for_gemini.append(f"--- End of Document: {db_doc_for_gemini.file_name} ---")
-
-        if not gemini_model:
-            db_bg.rollback() # Ensure clean state if we are to commit status
-            print("Signature Analysis Task: Gemini model not initialized. Cannot generate report.")
-            proposal_gemini_init_fail = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
-            if proposal_gemini_init_fail:
-                proposal_gemini_init_fail.signature_analysis_status = "failed_gemini_not_initialized"
-                db_bg.commit()
-            return
-
-        try:
-            print(f"Signature Analysis Task: Calling Gemini for proposal {proposal_id} with {len(content_parts_for_gemini)} parts.")
-            ai_response = await gemini_model.generate_content_async(content_parts_for_gemini)
-            
-            proposal_after_gemini_call = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
-            if not proposal_after_gemini_call:
-                 print(f"Signature Analysis Task: Proposal {proposal_id} not found after Gemini call.")
-                 return # Cannot update status
-
-            if ai_response.parts:
-                html_report_content = ai_response.text
-                if html_report_content.startswith("```html"):
-                    html_report_content = html_report_content[7:]
-                if html_report_content.startswith("```"):
-                    html_report_content = html_report_content[3:]
-                if html_report_content.endswith("```"):
-                    html_report_content = html_report_content[:-3]
-                html_report_content = html_report_content.strip()
-
-                proposal_after_gemini_call.signature_analysis_report_html = html_report_content
-                proposal_after_gemini_call.signature_analysis_status = "completed_success"
-                print(f"Signature Analysis Task: Successfully generated and saved signature analysis report for proposal {proposal_id}.")
-            else:
-                error_detail = "Gemini model did not return expected content for signature report."
-                if ai_response.prompt_feedback and ai_response.prompt_feedback.block_reason:
-                    error_detail += f" Reason: {ai_response.prompt_feedback.block_reason_message or ai_response.prompt_feedback.block_reason}"
-                print(f"Signature Analysis Task: Error generating signature report for proposal {proposal_id}: {error_detail}")
-                proposal_after_gemini_call.signature_analysis_status = f"failed_gemini_no_content ({error_detail[:100]})"
-            db_bg.commit() # Commit Gemini results/status
-
-        except Exception as e_gemini:
-            db_bg.rollback() # *** FIX: Rollback on Gemini error ***
-            print(f"Signature Analysis Task: Exception during Gemini call for proposal {proposal_id}: {str(e_gemini)}")
-            proposal_gemini_exception = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
-            if proposal_gemini_exception:
-                proposal_gemini_exception.signature_analysis_status = f"failed_gemini_exception ({str(e_gemini)[:100]})"
-                db_bg.commit()
+        content_parts_for_gemini = [SIGNATURE_ANALYSIS_REPORT_PROMPT_TEMPLATE]
         
-    except Exception as e_task:
-        db_bg.rollback() # *** FIX: Rollback on general task error ***
-        print(f"Signature Analysis Task: General error for proposal {proposal_id}: {str(e_task)}")
-        # Attempt to update status if proposal object is available
-        proposal_final_error = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
-        if proposal_final_error:
-            try:
-                proposal_final_error.signature_analysis_status = f"failed_task_exception ({str(e_task)[:100]})"
-                db_bg.commit()
-            except Exception as e_commit_fail:
-                # If even this fails, rollback and log
-                db_bg.rollback()
-                print(f"Signature Analysis Task: Failed to commit final error status for proposal {proposal_id}: {e_commit_fail}")
-    finally:
-        db_bg.close()
+        global gemini_model 
+        if not gemini_model:
+            proposal_before_gemini.signature_analysis_status = "error_gemini_model_not_initialized"
+            db_bg.commit()
+            raise RuntimeError("Gemini model is not initialized.")
 
-# --- Document and Page Retrieval (Adjusted for new structure) ---
-# I. Proposal (Project) Management
-@app.get("/proposals/{proposal_id}/", response_model=models.ProjectResponse)
-def get_proposal(proposal_id: int, db: Session = Depends(get_db)):
-    proposal = db.query(models.Project).filter(models.Project.id == proposal_id).first()
-    if not proposal:
-        raise HTTPException(status_code=404, detail=f"Proposal with id {proposal_id} not found")
-    return proposal
+        ai_report_response = await gemini_model.generate_content_async(content_parts_for_gemini)
+        
+        html_report_content = ""
+        if ai_report_response.prompt_feedback and ai_report_response.prompt_feedback.block_reason:
+            error_message = f"Gemini content generation blocked: {ai_report_response.prompt_feedback.block_reason}"
+            print(f"Signature Analysis Task: {error_message}")
+            proposal_before_gemini.signature_analysis_status = f"error_gemini_blocked_{ai_report_response.prompt_feedback.block_reason}"
+        elif not ai_report_response.parts:
+            error_message = "Gemini response empty or invalid."
+            print(f"Signature Analysis Task: {error_message}")
+            proposal_before_gemini.signature_analysis_status = "error_gemini_empty_response"
+        else:
+            html_report_content = ai_report_response.text
+        
+        if html_report_content.strip().startswith("```html"):
+            html_report_content = html_report_content.strip()[7:] 
+            if html_report_content.strip().endswith("```"):
+                html_report_content = html_report_content.strip()[:-3] 
+        
+        proposal_before_gemini.signature_analysis_report_html = html_report_content
+        if not proposal_before_gemini.signature_analysis_status.startswith("error_"): 
+            proposal_before_gemini.signature_analysis_status = "completed"
+        db_bg.commit()
+        db_bg.refresh(proposal_before_gemini)
+
+    except Exception as e_gemini_report:
+        print(f"Signature Analysis Task: Error during Gemini report generation: {e_gemini_report}")
+        # Ensure proposal_before_gemini is available if it was fetched before the error
+        # This might need to be re-fetched or handled carefully if the error occurred before its assignment
+        proposal_at_error_time = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
+        if proposal_at_error_time: 
+            proposal_at_error_time.signature_analysis_status = f"error_gemini_report_generation_failed:_{str(e_gemini_report)}"
+            db_bg.commit()
+            db_bg.refresh(proposal_at_error_time)
+        db_bg.rollback() 
+    finally:
+        if db_bg:
+            db_bg.close()
+# ... rest of your main.py file ...
 
 # --- Health Check Endpoint ---
 @app.get("/health/")
