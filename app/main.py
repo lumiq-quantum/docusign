@@ -19,6 +19,7 @@ from datetime import datetime # Added for report generation date
 import base64 # Add this import
 from pathlib import Path
 import asyncio
+import threading 
 
 from . import models
 # Updated model imports to reflect new structure and Pydantic schemas
@@ -734,11 +735,92 @@ async def start_signature_analysis_for_proposal(
     return {"message": f"Signature analysis initiated for proposal {proposal_id}."}
 
 
-async def perform_signature_analysis(proposal_id: int): # Removed db_bg: Session = Depends(get_db) as SessionLocal is used
+async def _process_page_with_textract_concurrently(
+    page_image_pil,  # PIL image object for the page
+    page_id: int,    # Database ID of the page
+    document_id: int,
+    page_number: int,  # 1-based page number for logging/context
+    textract_client_instance  # Pass the initialized Textract client
+):
     """
-    Background task to perform signature analysis using AWS Textract and Google Gemini.
+    Processes a single page with Textract in a way suitable for concurrent execution.
+    Returns data for SignatureInstance objects or error information.
     """
-    db_bg = SessionLocal() # Create a new session for this background task
+    # Convert PIL image to bytes for Textract
+    img_byte_arr_io = io.BytesIO()
+    page_image_pil.save(img_byte_arr_io, format='PNG')  # Or JPEG, ensure consistency
+    img_bytes_for_textract = img_byte_arr_io.getvalue()
+
+    signature_data_for_db = []  # To hold dicts for creating SignatureInstance objects
+    try:
+        current_thread_id = asyncio.get_running_loop().call_soon_threadsafe(lambda: threading.get_ident()) # For debug
+        print(f"Textract Task (Doc: {document_id}, Page: {page_number}, Thread: {current_thread_id}): Calling Textract...")
+
+        # AWS SDK calls are synchronous (blocking). Run in a separate thread
+        # to avoid blocking the asyncio event loop.
+        textract_response = await asyncio.to_thread(
+            textract_client_instance.analyze_document,
+            Document={'Bytes': img_bytes_for_textract},
+            FeatureTypes=['SIGNATURES']
+        )
+
+        signatures_found_on_page_count = 0
+        for block in textract_response.get('Blocks', []):
+            if block['BlockType'] == 'SIGNATURE':
+                signatures_found_on_page_count += 1
+                cropped_image_bytes = None
+                try:
+                    # Cropping logic (PIL operations are CPU-bound but generally fast for small crops)
+                    # If this part becomes a bottleneck, it could also be wrapped in asyncio.to_thread
+                    geometry = block['Geometry']
+                    bbox = geometry['BoundingBox']
+                    img_width, img_height = page_image_pil.size
+
+                    left = int(bbox['Left'] * img_width)
+                    top = int(bbox['Top'] * img_height)
+                    right = int((bbox['Left'] + bbox['Width']) * img_width)
+                    bottom = int((bbox['Top'] + bbox['Height']) * img_height)
+
+                    cropped_pil_image = page_image_pil.crop((left, top, right, bottom))
+
+                    cropped_img_byte_io = io.BytesIO()
+                    cropped_pil_image.save(cropped_img_byte_io, format='PNG')
+                    cropped_image_bytes = cropped_img_byte_io.getvalue()
+                    # print(f"Textract Task (Doc: {document_id}, Page: {page_number}): Successfully cropped signature.")
+                except Exception as e_crop:
+                    print(f"Textract Task (Doc: {document_id}, Page: {page_number}): Error cropping signature: {e_crop}")
+
+                # Prepare data for SignatureInstance. We don't create the SQLAlchemy model instance here
+                # to avoid passing session-bound objects or the session itself into sub-tasks.
+                signature_data_for_db.append({
+                    "page_id": page_id,
+                    "document_id": document_id,
+                    "bounding_box_json": json.dumps(block['Geometry']['BoundingBox']),
+                    "textract_response_json": json.dumps(block),
+                    "cropped_signature_image": cropped_image_bytes,
+                })
+
+        if signatures_found_on_page_count > 0:
+            print(f"Textract Task (Doc: {document_id}, Page: {page_number}): Found {signatures_found_on_page_count} signatures.")
+        # else:
+            # print(f"Textract Task (Doc: {document_id}, Page: {page_number}): No signatures found by Textract.")
+        
+        return {"status": "success", "page_id": page_id, "page_number": page_number, "data": signature_data_for_db}
+
+    except Exception as e_textract:
+        print(f"Textract Task (Doc: {document_id}, Page: {page_number}): Error during Textract API call or processing: {e_textract}")
+        return {"status": "error", "page_id": page_id, "page_number": page_number, "message": str(e_textract)}
+
+
+async def perform_signature_analysis(proposal_id: int):
+    """
+    Background task to perform signature analysis using AWS Textract (in parallel for pages)
+    and Google Gemini.
+    """
+    db_bg = SessionLocal()  # Create a new session for this background task
+    # textract_client should be initialized and available here
+    # gemini_model (global) and thegenai.Client() are used in the Gemini part
+
     try:
         proposal = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
         if not proposal:
@@ -747,118 +829,102 @@ async def perform_signature_analysis(proposal_id: int): # Removed db_bg: Session
 
         proposal.signature_analysis_status = "processing_textract"
         db_bg.commit()
-        db_bg.refresh(proposal) # Refresh to ensure status is updated before proceeding
+        db_bg.refresh(proposal)
 
-        all_signature_instances_data_for_gemini_prompt = [] # To collect data for Gemini
+        # This list will be populated after all Textract processing for all documents is done.
+        # The original `all_signature_instances_data_for_gemini_prompt` was populated inside the doc loop,
+        # which is fine if it's cleared or managed per proposal.
+        # For this version, we'll fetch all signatures fresh before the Gemini stage.
 
         for doc in proposal.documents:
             if not doc.pdf_file:
                 print(f"Signature Analysis Task: PDF file missing for document {doc.id} in proposal {proposal_id}.")
                 continue
             
+            # This re-query pattern was in your original code.
             current_proposal_status_doc = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
-            if not current_proposal_status_doc: # Should not happen if proposal existed initially
+            if not current_proposal_status_doc:
                 print(f"Signature Analysis Task: Proposal {proposal_id} disappeared during doc {doc.id} processing.")
-                return
+                return # Or handle error appropriately
             current_proposal_status_doc.signature_analysis_status = f"processing_textract_doc_{doc.id}"
             db_bg.commit()
-            db_bg.refresh(current_proposal_status_doc)
-
+            # db_bg.refresh(current_proposal_status_doc) # Refreshing 'proposal' object is usually preferred
 
             try:
-                # Convert whole PDF to images once, then process pages
-                images_from_pdf = convert_from_bytes(doc.pdf_file, dpi=200) # Added dpi as in previous working version
+                images_from_pdf = convert_from_bytes(doc.pdf_file, dpi=200)
             except Exception as e_conv:
                 print(f"Signature Analysis Task: Failed to convert PDF to images for doc {doc.id}: {e_conv}")
-                # Update proposal status directly on the 'proposal' object we are working with
-                proposal.signature_analysis_status = f"failed_pdf_conversion_doc_{doc.id}"
+                proposal.signature_analysis_status = f"failed_pdf_conversion_doc_{doc.id}" # Update main proposal object
                 db_bg.commit()
                 db_bg.refresh(proposal)
-                continue # Skip to next document
+                continue  # Skip to next document
 
-            for i, page_image_pil in enumerate(images_from_pdf): # page_image_pil is a PIL Image object
+            # --- Parallel Textract Processing for Pages of current document ---
+            page_processing_tasks = []
+            # Pre-fetch page DB objects for this document to get their IDs efficiently
+            page_db_objects_map = {
+                p.page_number: p for p in db_bg.query(models.Page).filter(models.Page.document_id == doc.id).all()
+            }
+
+            for i, page_image_pil in enumerate(images_from_pdf):
                 page_number = i + 1
-                db_page = db_bg.query(models.Page).filter(
-                    models.Page.document_id == doc.id,
-                    models.Page.page_number == page_number
-                ).first()
+                db_page_obj = page_db_objects_map.get(page_number)
 
-                if not db_page:
-                    print(f"Signature Analysis Task: Page entry not found for doc {doc.id}, page {page_number}. Skipping Textract.")
+                if not db_page_obj:
+                    print(f"Signature Analysis Task: Page DB entry not found for doc {doc.id}, page {page_number}. Skipping Textract task creation.")
                     continue
 
-                # Convert PIL image to bytes for Textract
-                img_byte_arr_io = io.BytesIO() # Renamed to avoid confusion
-                page_image_pil.save(img_byte_arr_io, format='PNG') # Or JPEG
-                img_bytes_for_textract = img_byte_arr_io.getvalue()
-
-                try:
-                    print(f"Signature Analysis Task: Calling Textract for doc {doc.id}, page {page_number}...")
-                    textract_response = textract_client.analyze_document(
-                        Document={'Bytes': img_bytes_for_textract},
-                        FeatureTypes=['SIGNATURES']
+                page_processing_tasks.append(
+                    _process_page_with_textract_concurrently(
+                        page_image_pil,
+                        db_page_obj.id,
+                        doc.id,
+                        page_number,
+                        textract_client  # Pass your initialized textract_client
                     )
-                    
-                    signatures_found_on_page_count = 0
-                    for block in textract_response.get('Blocks', []):
-                        if block['BlockType'] == 'SIGNATURE':
-                            signatures_found_on_page_count += 1
-                            
-                            cropped_image_bytes = None
-                            try:
-                                geometry = block['Geometry']
-                                bbox = geometry['BoundingBox']
-                                img_width, img_height = page_image_pil.size
-                                
-                                left = int(bbox['Left'] * img_width)
-                                top = int(bbox['Top'] * img_height)
-                                right = int((bbox['Left'] + bbox['Width']) * img_width)
-                                bottom = int((bbox['Top'] + bbox['Height']) * img_height)
-                                
-                                cropped_pil_image = page_image_pil.crop((left, top, right, bottom))
-                                
-                                cropped_img_byte_io = io.BytesIO()
-                                cropped_pil_image.save(cropped_img_byte_io, format='PNG')
-                                cropped_image_bytes = cropped_img_byte_io.getvalue()
-                                print(f"Signature Analysis Task: Successfully cropped signature for doc {doc.id}, page {page_number}")
-                            except Exception as e_crop:
-                                print(f"Signature Analysis Task: Error cropping signature for doc {doc.id}, page {page_number}: {e_crop}")
-
-                            db_signature_instance = models.SignatureInstance(
-                                page_id=db_page.id,
-                                document_id=doc.id, # Storing document_id directly as well
-                                # stakeholder_id will be linked later
-                                bounding_box_json=json.dumps(block['Geometry']['BoundingBox']), # Store as JSON string
-                                textract_response_json=json.dumps(block), # Store as JSON string
-                                cropped_signature_image=cropped_image_bytes
-                            )
-                            db_bg.add(db_signature_instance)
-                            # We need to commit here to get the ID for all_signature_instances_data_for_gemini_prompt
-                            # However, committing frequently can be slow. Alternative: append object and query later.
-                            # For now, let's commit after processing all signatures on a page.
-                    
-                    if signatures_found_on_page_count > 0:
-                        db_bg.commit() # Commit after processing all signatures on the page
-                        db_bg.refresh(proposal) # Refresh proposal to get updated relations if needed
-                        print(f"Signature Analysis Task: Found and stored {signatures_found_on_page_count} signatures for doc {doc.id}, page {page_number}.")
-                    else:
-                        print(f"Signature Analysis Task: No signatures found by Textract for doc {doc.id}, page {page_number}.")
-
-                except Exception as e_textract:
-                    print(f"Signature Analysis Task: Error calling Textract for doc {doc.id}, page {page_number}: {e_textract}")
-                    proposal.signature_analysis_status = f"failed_textract_doc_{doc.id}_page_{page_number}"
-                    db_bg.commit()
-                    db_bg.refresh(proposal)
+                )
             
-            # After processing all pages of a document, update status
-            current_proposal_status_doc_done = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
+            new_signature_instances_for_this_document = []
+            document_textract_processing_had_errors = False
+            if page_processing_tasks:
+                print(f"Signature Analysis Task (Doc: {doc.id}): Launching {len(page_processing_tasks)} Textract page tasks in parallel.")
+                # Note: Consider asyncio.Semaphore here if you have many pages per doc to limit concurrency
+                results = await asyncio.gather(*page_processing_tasks, return_exceptions=True)
+                
+                for result in results:
+                    if isinstance(result, Exception):  # Unhandled exception from gather itself
+                        print(f"Signature Analysis Task (Doc: {doc.id}): A page task failed unexpectedly (gather exception): {result}")
+                        document_textract_processing_had_errors = True
+                    elif isinstance(result, dict): # Expected result from helper
+                        if result.get("status") == "success":
+                            for sig_data_dict in result.get("data", []):
+                                new_signature_instances_for_this_document.append(models.SignatureInstance(**sig_data_dict))
+                        elif result.get("status") == "error":
+                            print(f"Signature Analysis Task (Doc: {doc.id}, Page: {result.get('page_number')}): Failed Textract processing for page: {result.get('message')}")
+                            document_textract_processing_had_errors = True
+                    else: # Unexpected result type
+                        print(f"Signature Analysis Task (Doc: {doc.id}): A page task returned an unexpected result type: {result}")
+                        document_textract_processing_had_errors = True
+            
+            if new_signature_instances_for_this_document:
+                db_bg.add_all(new_signature_instances_for_this_document)
+                # Commit all signatures found in this document by Textract in one transaction
+                db_bg.commit() 
+                print(f"Signature Analysis Task (Doc: {doc.id}): Stored {len(new_signature_instances_for_this_document)} new signatures from Textract.")
+                # No need to refresh proposal here unless adding signatures affects a direct relationship used immediately
+            
+            # Update document processing status
+            current_proposal_status_doc_done = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first() # Re-query as per original pattern
             if current_proposal_status_doc_done:
-                 current_proposal_status_doc_done.signature_analysis_status = f"completed_textract_doc_{doc.id}"
-                 db_bg.commit()
-                 db_bg.refresh(current_proposal_status_doc_done)
+                if document_textract_processing_had_errors:
+                    current_proposal_status_doc_done.signature_analysis_status = f"completed_textract_doc_{doc.id}_with_errors"
+                else:
+                    current_proposal_status_doc_done.signature_analysis_status = f"completed_textract_doc_{doc.id}"
+                db_bg.commit()
+                # db_bg.refresh(current_proposal_status_doc_done)
+            # --- End of Parallel Textract Processing for current document ---
 
-
-        # After processing all documents and pages:
+        # --- Gemini Processing Stage (largely as per your original structure) ---
         proposal_for_gemini = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
         if not proposal_for_gemini:
             print(f"Signature Analysis Task: Proposal {proposal_id} not found before Gemini stage.")
@@ -869,60 +935,80 @@ async def perform_signature_analysis(proposal_id: int): # Removed db_bg: Session
         db_bg.refresh(proposal_for_gemini)
 
         # Fetch all signature instances for the proposal to build the prompt
-        current_signature_instances = db_bg.query(models.SignatureInstance).join(models.Page).join(models.Document).filter(models.Document.project_id == proposal_id).all()
+        # This query will fetch all instances committed from the Textract stage above.
+        current_signature_instances = db_bg.query(models.SignatureInstance)\
+            .join(models.Page).join(models.Document)\
+            .filter(models.Document.project_id == proposal_id).all()
 
         if not current_signature_instances:
-            print(f"Signature Analysis Task: No signatures found in any document for proposal {proposal_id}. Skipping Gemini report.")
+            print(f"Signature Analysis Task: No signatures found in any document for proposal {proposal_id} after Textract. Skipping Gemini report.")
             proposal_for_gemini.signature_analysis_status = "completed_no_signatures"
-            # Storing JSON for consistency, even if it's a simple message
-            proposal_for_gemini.signature_analysis_report_json = {"message": "No signatures were detected in the submitted documents."}
+            proposal_for_gemini.signature_analysis_report_json = {"message": "No signatures were detected in the submitted documents by Textract."} # Store JSON as string or use JSON type if DB supports
             db_bg.commit()
             db_bg.refresh(proposal_for_gemini)
             return
 
-        for sig_instance in current_signature_instances:
-            document_fetch = db_bg.query(Document).filter(Document.id == sig_instance.document_id).first()
+        all_signature_instances_data_for_gemini_prompt = []
+        for sig_instance in current_signature_instances: # This loop has N+1 query potential
+            # The N+1 query problem was in your original code here. For minimal changes, I'm leaving it.
+            # To fix, use joinedload when fetching current_signature_instances or query documents/pages separately once.
+            document_fetch_for_gemini = db_bg.query(models.Document).filter(models.Document.id == sig_instance.document_id).first()
+            page_fetch_for_gemini = db_bg.query(models.Page).filter(models.Page.id == sig_instance.page_id).first()
+            
+            doc_name = document_fetch_for_gemini.file_name if document_fetch_for_gemini else "Unknown Document"
+            page_num = page_fetch_for_gemini.page_number if page_fetch_for_gemini else "Unknown Page"
 
-            page_fetch = db_bg.query(models.Page).filter(models.Page.id == sig_instance.page_id).first()
             all_signature_instances_data_for_gemini_prompt.append({
-                "document_name": document_fetch.file_name,
-                "page_number": page_fetch.page_number,
+                "document_name": doc_name,
+                "page_number": page_num,
                 "textract_bounding_box": json.loads(sig_instance.bounding_box_json) if isinstance(sig_instance.bounding_box_json, str) else sig_instance.bounding_box_json,
-                "signature_image_url": f"http://localhost:8000/proposals/{proposal_id}/signatures/{sig_instance.id}/image",
-                # Add other relevant parts of textract_response_json if needed
+                "signature_image_url": f"http://localhost:8000/proposals/{proposal_id}/signatures/{sig_instance.id}/image", # Make base URL configurable
             })
-
-        # stakeholders = db_bg.query(models.Stakeholder).filter(models.Stakeholder.project_id == proposal_id).all()
-        # stakeholder_names = [s.name for s in stakeholders] if stakeholders else []
-
-        document_fetch = db_bg.query(Document).filter(Document.project_id == proposal_id).all()
-
+        
+        # Fetching document URLs for Gemini (as per your original)
+        documents_for_gemini_urls = db_bg.query(models.Document).filter(models.Document.project_id == proposal_id).all()
         docUrls = []
+        for doc_obj in documents_for_gemini_urls: # Renamed 'doc' to 'doc_obj' to avoid conflict with outer loop 'doc'
+            docUrls.append(f"http://localhost:8000/proposals/{doc_obj.project_id}/documents/{doc_obj.id}/pdf") # Make base URL configurable
+
+        print(f"Document URLs for Gemini: {docUrls}")
+        
+        # Using thegenai.Client as per your original Gemini section
+        # Ensure 'thegenai' is imported and client configured if needed
+        try:
+            client = thegenai.Client() # Ensure this client is configured for auth if needed
+        except Exception as e_thegenai_client:
+            print(f"Signature Analysis Task: Failed to initialize thegenai.Client: {e_thegenai_client}")
+            proposal_for_gemini.signature_analysis_status = "failed_gemini_client_init"
+            db_bg.commit()
+            return
+
+
         docData = []
-
-        for doc in document_fetch:
-            docUrls.append("http://localhost:8000/proposals/"+str(doc.project_id)+"/documents/"+str(doc.id)+"/pdf")
-
-
-        print(docUrls)
-        client = thegenai.Client()
-
-
-        for doc_url in docUrls:
-            print(f"Document URL: {doc_url}")
-            doc_data = io.BytesIO(httpx.get(doc_url).content)
-            doc_pdf = client.files.upload(
-                file=doc_data,
-                config=dict(mime_type='application/pdf')
-            )
-            docData.append(doc_pdf)
-
-
-
-
-
-        # Updated Gemini Prompt for JSON output
-        gemini_prompt_text = f"""
+        # The httpx.get calls here are synchronous. For a fully async function, these should be async.
+        # To keep changes minimal to "existing code", this is left as is from your snippet.
+        print(f"Signature Analysis Task: Fetching PDF bytes for Gemini via HTTP...")
+        try:
+            for doc_url in docUrls:
+                print(f"Fetching content from: {doc_url}")
+                response = httpx.get(doc_url) # Synchronous call
+                response.raise_for_status() # Check for HTTP errors
+                doc_data_bytes = io.BytesIO(response.content)
+                # The file upload to Gemini SDK might also be synchronous or async
+                # Assuming synchronous here based on client.models.generate_content later
+                uploaded_file = client.files.upload( # This might be sync or async depending on thegenai SDK
+                    file=doc_data_bytes,
+                    config=dict(mime_type='application/pdf') # Ensure this config is correct for the SDK
+                )
+                docData.append(uploaded_file)
+                print(f"Uploaded {doc_url} to Gemini files.")
+        except Exception as e_http_fetch_upload:
+            print(f"Signature Analysis Task: Error fetching or uploading PDF for Gemini: {e_http_fetch_upload}")
+            proposal_for_gemini.signature_analysis_status = "failed_gemini_pdf_fetch_upload"
+            db_bg.commit()
+            return
+        
+        gemini_prompt_text = f""" 
         Hi i am building an application where i will upload multiple pdf documents and there can be multiple signature of different stake holders
         We need to do the signature matching of all the stakeholders
         Basically for 1 type of stakeholder all their signature shoud be matching
@@ -955,25 +1041,27 @@ async def perform_signature_analysis(proposal_id: int): # Removed db_bg: Session
         Ensure the report is suitable for review by a human analyst.
         """
         
-        global gemini_model # Ensure it's accessible
-        if not gemini_model:
-            proposal_for_gemini.signature_analysis_status = "error_gemini_model_not_initialized"
-            db_bg.commit()
-            raise RuntimeError("Gemini model is not initialized for background task.")
+        # global gemini_model # This was in your code, but 'client' from thegenai is used for the call
+        # Check if the 'gemini_model' global is still relevant or if 'client' is the sole Gemini interface here.
+        # The code below uses `client.models.generate_content`, not the global `gemini_model`.
+        # If `gemini_model` was for a different async client, this part needs reconciliation.
+        # Assuming `thegenai.Client().models.generate_content` is the intended synchronous call as per your snippet.
 
         try:
-            print(f"Signature Analysis Task: Calling Gemini for proposal {proposal_id} JSON report...")
-            
+            print(f"Signature Analysis Task: Calling Gemini for proposal {proposal_id} HTML report...")
+            # This call `client.models.generate_content` is likely synchronous.
+            # In an async function, this will block the event loop.
+            # To keep changes minimal to "existing code", this is left as is.
             ai_response = client.models.generate_content(
-                model="gemini-2.5-flash-preview-05-20",
-                contents=docData+[gemini_prompt_text])
+                model="gemini-2.5-flash-preview-05-20", # Model name from your snippet, ensure it's current
+                contents=docData + [gemini_prompt_text] # Ensure docData format is compatible
+            )
 
-            # ai_response = await gemini_model.generate_content_async(gemini_prompt_text)
-            print("AI Response:", ai_response)
+            print(f"AI Response received. Type: {type(ai_response)}, Parts: {hasattr(ai_response, 'parts')}, Text: {hasattr(ai_response, 'text')}")
 
-            if ai_response.text:
+
+            if hasattr(ai_response, 'text') and ai_response.text: # Check if text attribute exists and is not empty
                 html_report = ai_response.text
-                # Clean up
                 if html_report.startswith("```html"): html_report = html_report[7:]
                 if html_report.startswith("```"): html_report = html_report[3:]
                 if html_report.endswith("```"): html_report = html_report[:-3]
@@ -981,29 +1069,18 @@ async def perform_signature_analysis(proposal_id: int): # Removed db_bg: Session
                 
                 proposal_for_gemini.signature_analysis_report_html = html_report
                 proposal_for_gemini.signature_analysis_status = "completed"
-                print(f"Signature Analysis Task: Successfully generated signature analysis report for proposal {proposal_id}.")
-
-                # try:
-                #     json_report = json.loads(generated_text)
-                #     proposal_for_gemini.signature_analysis_report_json = json_report
-                #     proposal_for_gemini.signature_analysis_status = "completed"
-                #     print(f"Signature Analysis Task: Successfully generated JSON signature analysis report for proposal {proposal_id}.")
-                # except json.JSONDecodeError as e_json:
-                #     print(f"Signature Analysis Task: Gemini returned non-JSON response for proposal {proposal_id}: {e_json}")
-                #     print(f"Received text: {generated_text}")
-                #     proposal_for_gemini.signature_analysis_status = "failed_gemini_invalid_json"
-                #     proposal_for_gemini.signature_analysis_report_json = {
-                #         "error": "Failed to parse Gemini response as JSON.", 
-                #         "details": str(e_json),
-                #         "received_text": generated_text
-                #     }
+                print(f"Signature Analysis Task: Successfully generated signature analysis HTML report for proposal {proposal_id}.")
             else:
-                error_detail = "Gemini did not return expected content for signature report."
-                if ai_response.prompt_feedback and ai_response.prompt_feedback.block_reason:
-                    error_detail += f" Reason: {ai_response.prompt_feedback.block_reason_message or ai_response.prompt_feedback.block_reason}"
-                print(f"Signature Analysis Task: Error generating report for proposal {proposal_id}: {error_detail}")
+                error_detail = "Gemini did not return expected text content for signature report."
+                # The original code had `ai_response.prompt_feedback` which might not exist on `thegenai` client's response object
+                # Adjust error feedback parsing based on actual `thegenai` response structure for errors.
+                # For now, a generic message:
+                # if hasattr(ai_response, 'prompt_feedback') and ai_response.prompt_feedback and ai_response.prompt_feedback.block_reason:
+                #    error_detail += f" Reason: {ai_response.prompt_feedback.block_reason_message or ai_response.prompt_feedback.block_reason}"
+                print(f"Signature Analysis Task: Error generating report for proposal {proposal_id}: {error_detail}. AI Response: {ai_response}")
                 proposal_for_gemini.signature_analysis_status = "failed_gemini_report_generation"
-                proposal_for_gemini.signature_analysis_report_json = {"error": error_detail}
+                # Storing error in JSON field, ensure it's a dict or JSON string
+                proposal_for_gemini.signature_analysis_report_json = {"error": error_detail, "ai_response_debug": str(ai_response)} 
             
             db_bg.commit()
             db_bg.refresh(proposal_for_gemini)
@@ -1017,14 +1094,14 @@ async def perform_signature_analysis(proposal_id: int): # Removed db_bg: Session
 
     except Exception as e_task:
         print(f"Signature Analysis Task: General error for proposal {proposal_id}: {e_task}")
-        # Ensure db_bg is active and proposal object is available for update
+        import traceback
+        traceback.print_exc()
         if db_bg.is_active:
             try:
-                # Re-fetch proposal within this exception block to ensure it's current
                 proposal_at_error = db_bg.query(models.Project).filter(models.Project.id == proposal_id).first()
                 if proposal_at_error and proposal_at_error.signature_analysis_status not in [
                     "completed", "failed_gemini_report_generation", "failed_gemini_exception", 
-                    "completed_no_signatures", "failed_gemini_invalid_json" # Added new states
+                    "completed_no_signatures" # Removed "failed_gemini_invalid_json" as JSON parsing was removed
                 ]:
                     proposal_at_error.signature_analysis_status = "failed_unknown_task_error"
                     proposal_at_error.signature_analysis_report_json = {"error": f"An unexpected error occurred during analysis: {str(e_task)}"}
@@ -1033,9 +1110,8 @@ async def perform_signature_analysis(proposal_id: int): # Removed db_bg: Session
                  print(f"Signature Analysis Task: Error during final error commit for proposal {proposal_id}: {e_final_commit}")
                  db_bg.rollback() 
     finally:
-        if db_bg.is_active: # Check if session is active before closing
+        if db_bg.is_active:
             db_bg.close()
-
 # --- Health Check Endpoint ---
 @app.get("/health/")
 def health_check():
