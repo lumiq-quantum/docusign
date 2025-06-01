@@ -20,7 +20,7 @@ class Project(Base):
     application_number = Column(String, unique=True, index=True, nullable=True) # Added
     chat_session_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-    signature_analysis_report_html = Column(Text, nullable=True) # Added
+    signature_analysis_report_json = Column(JSON, nullable=True) # Changed from _html, type Text to JSON
     signature_analysis_status = Column(String, nullable=True, default="pending") # Added
 
     # Relationships
@@ -191,7 +191,7 @@ class ProjectResponse(ProjectBase):
     id: int
     application_number: Optional[str] = None # Added
     created_at: datetime
-    signature_analysis_report_html: Optional[str] = None # Added
+    signature_analysis_report_json: Optional[dict] = None # Changed from _html, type str to dict
     signature_analysis_status: Optional[str] = None # Added
     documents: List[DocumentResponse] = []
     stakeholders: List[StakeholderResponse] = []
