@@ -14,6 +14,7 @@ import httpx # Added for HTTP client
 import os
 import PyPDF2 # For PDF processing
 import google.generativeai as genai # Corrected import
+from google import genai as thegenai
 from datetime import datetime # Added for report generation date
 import base64 # Add this import
 from pathlib import Path
@@ -725,57 +726,78 @@ async def perform_signature_analysis(proposal_id: int): # Removed db_bg: Session
             return
 
         for sig_instance in current_signature_instances:
+            document_fetch = db_bg.query(Document).filter(Document.id == sig_instance.document_id).first()
+
+            page_fetch = db_bg.query(models.Page).filter(models.Page.id == sig_instance.page_id).first()
             all_signature_instances_data_for_gemini_prompt.append({
-                "signature_database_id": sig_instance.id,
-                "document_id": sig_instance.document_id,
-                "page_id": sig_instance.page_id,
+                "document_name": document_fetch.file_name,
+                "page_number": page_fetch.page_number,
                 "textract_bounding_box": json.loads(sig_instance.bounding_box_json) if isinstance(sig_instance.bounding_box_json, str) else sig_instance.bounding_box_json,
-                "textract_confidence": json.loads(sig_instance.textract_response_json).get('Confidence', 'N/A') if isinstance(sig_instance.textract_response_json, str) else 'N/A'
+                "signature_image_url": f"http://localhost:8081/proposals/{proposal_id}/signatures/{sig_instance.id}/image",
                 # Add other relevant parts of textract_response_json if needed
             })
 
         # stakeholders = db_bg.query(models.Stakeholder).filter(models.Stakeholder.project_id == proposal_id).all()
         # stakeholder_names = [s.name for s in stakeholders] if stakeholders else []
 
+        document_fetch = db_bg.query(Document).filter(Document.project_id == proposal_id).all()
+
+        docUrls = []
+        docData = []
+
+        for doc in document_fetch:
+            docUrls.append("http://localhost:8081/proposals/"+str(doc.project_id)+"/documents/"+str(doc.id)+"/pdf")
+
+
+        print(docUrls)
+        client = thegenai.Client()
+
+
+        for doc_url in docUrls:
+            print(f"Document URL: {doc_url}")
+            doc_data = io.BytesIO(httpx.get(doc_url).content)
+            doc_pdf = client.files.upload(
+                file=doc_data,
+                config=dict(mime_type='application/pdf')
+            )
+            docData.append(doc_pdf)
+
+
+
+
 
         # Updated Gemini Prompt for JSON output
         gemini_prompt_text = f"""
-        You are an expert in signature analysis for financial and legal documents.
-        Proposal ID: {proposal_id}.
+        Hi i am building an application where i will upload multiple pdf documents and there can be multiple signature of different stake holders
+        We need to do the signature matching of all the stakeholders
+        Basically for 1 type of stakeholder all their signature shoud be matching
+        And no two stake holder can be same person so no two stakeholder signature should match
+        I have given you all the documents also for the processing, after doing the signature analysis please build the final report, how should be the UI of 
+        the final report. Please generate the report very intituitive
 
-        Data for detected signatures:
+        Along with the documents provided are are some of the signatures we have detected using the amazon textract service. use this information if needed. But not necessary.
         {json.dumps(all_signature_instances_data_for_gemini_prompt, indent=2)}
+        Here we have provided the image URLs for the detected signatures. You can use these URLs to include images in your report using the <img> tag in HTML.
 
-        Task: Generate a JSON report with the following structure:
-        {{
-          "proposal_id": {proposal_id},
-          "overall_summary": {{
-            "total_signatures_detected": <integer>,
-            "key_observations": ["<observation1>", "<observation2>"],
-            "recommendations": ["<recommendation1>"]
-          }},
-          "signature_details": [
-            {{
-              "signature_database_id": <integer>,
-              "document_id": <integer>,
-              "page_id": <integer>,
-              "textract_confidence": <float_or_string>,
-              "analysis": {{
-                "consistency_with_stakeholder_pattern": "<Pending/Not Applicable/Low/Medium/High - if stakeholder known and patterns exist>",
-                "potential_anomalies": ["<anomaly1>", "<anomaly2_if_any>"],
-                "comments": "<General comments about this specific signature>"
-              }}
-            }}
-            // ... more signature entries
-          ]
-        }}
+        Task: Generate a comprehensive HTML report analyzing the signatures detected in the provided documents.
 
         Focus on:
-        1. Intra-Stakeholder Consistency (General patterns if stakeholder not linked yet).
-        2. Inter-Stakeholder Uniqueness (General patterns if stakeholder not linked yet).
+        1. Intra-Stakeholder Consistency (Where all the signature of a particular stakeholder is matched).
+        2. Inter-Stakeholder Uniqueness (No two stakeholder should have matching signatures).
         3. Overall Observations: Anomalies, low-confidence detections.
-        Acknowledge that signatures are not yet linked to specific stakeholders.
-        Provide concise, factual analysis.
+
+        Have the following sections in the report:
+        1. Overall Summary
+            1.1 Document Analysed
+            1.2 Stakeholders Identified
+            1.3 Overall Status (e.g., "All signatures match", "Some signatures do not match", etc.)
+        2. Detailed Stakeholder Analysis
+            List of all stakeholders with their signatures, status, and any anomalies with the analysis result.
+        3. Cross-Stakeholder Uniqueness Verification
+            Table confirms that no two distinct stakeholders share the same signature
+
+        Provide the report in a well-structured HTML format use javascript and css to make it more interactive and user friendly.
+        Ensure the report is suitable for review by a human analyst.
         """
         
         global gemini_model # Ensure it's accessible
@@ -787,36 +809,39 @@ async def perform_signature_analysis(proposal_id: int): # Removed db_bg: Session
         try:
             print(f"Signature Analysis Task: Calling Gemini for proposal {proposal_id} JSON report...")
             
-            ai_response = await gemini_model.generate_content_async(gemini_prompt_text)
+            ai_response = client.models.generate_content(
+                model="gemini-2.5-flash-preview-05-20",
+                contents=docData+[gemini_prompt_text])
 
-            if ai_response.parts:
-                generated_text = ai_response.text
-                # Clean up potential markdown code block fences for JSON
-                if generated_text.strip().startswith("```json"):
-                    generated_text = generated_text.strip()[7:]
-                    if generated_text.strip().endswith("```"):
-                        generated_text = generated_text.strip()[:-3]
-                elif generated_text.strip().startswith("```"): # More generic cleanup
-                    generated_text = generated_text.strip()[3:]
-                    if generated_text.strip().endswith("```"):
-                        generated_text = generated_text.strip()[:-3]
+            # ai_response = await gemini_model.generate_content_async(gemini_prompt_text)
+            print("AI Response:", ai_response)
+
+            if ai_response.text:
+                html_report = ai_response.text
+                # Clean up
+                if html_report.startswith("```html"): html_report = html_report[7:]
+                if html_report.startswith("```"): html_report = html_report[3:]
+                if html_report.endswith("```"): html_report = html_report[:-3]
+                html_report = html_report.strip()
                 
-                generated_text = generated_text.strip()
+                proposal_for_gemini.signature_analysis_report_html = html_report
+                proposal_for_gemini.signature_analysis_status = "completed"
+                print(f"Signature Analysis Task: Successfully generated signature analysis report for proposal {proposal_id}.")
 
-                try:
-                    json_report = json.loads(generated_text)
-                    proposal_for_gemini.signature_analysis_report_json = json_report
-                    proposal_for_gemini.signature_analysis_status = "completed"
-                    print(f"Signature Analysis Task: Successfully generated JSON signature analysis report for proposal {proposal_id}.")
-                except json.JSONDecodeError as e_json:
-                    print(f"Signature Analysis Task: Gemini returned non-JSON response for proposal {proposal_id}: {e_json}")
-                    print(f"Received text: {generated_text}")
-                    proposal_for_gemini.signature_analysis_status = "failed_gemini_invalid_json"
-                    proposal_for_gemini.signature_analysis_report_json = {
-                        "error": "Failed to parse Gemini response as JSON.", 
-                        "details": str(e_json),
-                        "received_text": generated_text
-                    }
+                # try:
+                #     json_report = json.loads(generated_text)
+                #     proposal_for_gemini.signature_analysis_report_json = json_report
+                #     proposal_for_gemini.signature_analysis_status = "completed"
+                #     print(f"Signature Analysis Task: Successfully generated JSON signature analysis report for proposal {proposal_id}.")
+                # except json.JSONDecodeError as e_json:
+                #     print(f"Signature Analysis Task: Gemini returned non-JSON response for proposal {proposal_id}: {e_json}")
+                #     print(f"Received text: {generated_text}")
+                #     proposal_for_gemini.signature_analysis_status = "failed_gemini_invalid_json"
+                #     proposal_for_gemini.signature_analysis_report_json = {
+                #         "error": "Failed to parse Gemini response as JSON.", 
+                #         "details": str(e_json),
+                #         "received_text": generated_text
+                #     }
             else:
                 error_detail = "Gemini did not return expected content for signature report."
                 if ai_response.prompt_feedback and ai_response.prompt_feedback.block_reason:
@@ -863,6 +888,39 @@ def health_check():
     Health check endpoint to verify if the API is running.
     """
     return {"status": "ok"}
+
+
+
+@app.get("/proposals/{proposal_id}/documents/{document_id}/pdf")
+async def get_document_page_pdf(
+    proposal_id: int, 
+    document_id: int, 
+    db: Session = Depends(get_db)
+):
+    db_doc = db.query(models.Document).filter(
+        models.Document.id == document_id,
+        models.Document.project_id == proposal_id
+    ).first()
+
+    if not db_doc:
+        raise HTTPException(status_code=404, detail=f"Document with id {document_id} in proposal {proposal_id} not found")
+    if not db_doc.pdf_file:
+        raise HTTPException(status_code=404, detail="PDF file not found for this document")
+
+    try:
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(db_doc.pdf_file))
+        # print(pdf_reader, "Total pages:", len(pdf_reader.pages))
+        pdf_writer = PyPDF2.PdfWriter()
+        for page_number in range(1, len(pdf_reader.pages) + 1):
+            pdf_writer.add_page(pdf_reader.pages[page_number - 1])  # PyPDF2 pages are 0-indexed
+
+        output_pdf_buffer = io.BytesIO()
+        pdf_writer.write(output_pdf_buffer)
+        output_pdf_buffer.seek(0)
+
+        return Response(content=output_pdf_buffer.read(), media_type="application/pdf")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing PDF page: {str(e)}")
 
 # Main application entry point for Uvicorn
 # To run: uvicorn app.main:app --reload

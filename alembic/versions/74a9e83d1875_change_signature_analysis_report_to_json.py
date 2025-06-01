@@ -23,21 +23,21 @@ def upgrade() -> None:
     # To prevent errors from existing non-JSON data (e.g., HTML),
     # we set the column to NULL before changing its type.
     # This means any existing data in this column will be lost.
-    op.execute("UPDATE projects SET signature_analysis_report_html = NULL WHERE signature_analysis_report_html IS NOT NULL")
+    # op.execute("UPDATE projects SET signature_analysis_report_html = NULL WHERE signature_analysis_report_html IS NOT NULL")
 
-    op.alter_column('projects',
-                    'signature_analysis_report_html',
-                    new_column_name='signature_analysis_report_json',
-                    type_=sa.JSON(),
-                    existing_type=sa.Text(),
-                    postgresql_using='signature_analysis_report_html::json')
+    # op.alter_column('projects',
+    #                 'signature_analysis_report_html',
+    #                 new_column_name='signature_analysis_report_json',
+    #                 type_=sa.JSON(),
+    #                 existing_type=sa.Text(),
+    #                 postgresql_using='signature_analysis_report_html::json')
 
 
 def downgrade() -> None:
     """Downgrade schema."""
-    op.alter_column('projects',
-                    'signature_analysis_report_json',
-                    new_column_name='signature_analysis_report_html',
-                    type_=sa.Text(),
-                    existing_type=sa.JSON(),
-                    postgresql_using='signature_analysis_report_json::text')
+    # op.alter_column('projects',
+    #                 'signature_analysis_report_json',
+    #                 new_column_name='signature_analysis_report_html',
+    #                 type_=sa.Text(),
+    #                 existing_type=sa.JSON(),
+    #                 postgresql_using='signature_analysis_report_json::text')

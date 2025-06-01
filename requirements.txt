@@ -14,3 +14,4 @@ httpx
 boto3 # For AWS Textract
 pdf2image # For PDF to image conversion (requires poppler)
 PyPDF2
+google-genai

@@ -151,7 +151,7 @@ cython_debug/
 logs/
 
 # Local data directories (if not managed by Docker volumes defined in repo)
-postgres_data
+postgres_data*
 
 # Alembic specific (usually .db files if using sqlite for local dev/testing outside docker)
 # *.db
