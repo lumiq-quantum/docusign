@@ -18,6 +18,7 @@ from google import genai as thegenai
 from datetime import datetime # Added for report generation date
 import base64 # Add this import
 from pathlib import Path
+import asyncio
 
 from . import models
 # Updated model imports to reflect new structure and Pydantic schemas
@@ -336,7 +337,10 @@ async def trigger_document_html_extraction(
 
     # Here, we'll define a background task to process all pages.
     # The actual AI call logic will be in a helper function.
-    background_tasks.add_task(generate_html_for_document_pages, document_id, db_doc.project_id, db) # Pass db or necessary components
+    # background_tasks.add_task(generate_html_for_document_pages, document_id, db_doc.project_id, db) # Pass db or necessary components
+    background_tasks.add_task(generate_html_for_document_pages_parallel, document_id, db_doc.project_id) # Pass db or necessary components
+
+    
 
     return {"message": f"HTML extraction initiated for all pages of document {document_id} in proposal {proposal_id}."}
 
@@ -422,6 +426,157 @@ async def generate_html_for_document_pages(document_id: int, proposal_id: int, d
     finally:
         db_bg.close() # Ensure the session is closed
 
+
+
+async def process_single_page_concurrently(
+    page_id: int,
+    page_number: int,
+    document_pdf_bytes: bytes, # Pass the whole PDF bytes
+    # gemini_model_instance # Pass the model instance if not truly global in worker context
+):
+    """
+    Processes a single page: extracts it, calls Gemini, and updates the DB.
+    This function will manage its own database session.
+    """
+    print(f"Task - Starting processing for page ID {page_id}, page number {page_number}")
+    # Create a new session for this specific task to ensure DB operation isolation
+    db_task_session = SessionLocal()
+    try:
+        # --- 1. PDF Page Extraction (using the passed document_pdf_bytes) ---
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(document_pdf_bytes))
+        if not (0 < page_number <= len(pdf_reader.pages)):
+            print(f"Task - Page number {page_number} out of range for page ID {page_id}. Skipping.")
+            return {"page_id": page_id, "status": "error", "message": "Page number out of range"}
+
+        pdf_writer = PyPDF2.PdfWriter()
+        pdf_writer.add_page(pdf_reader.pages[page_number - 1])
+        single_page_pdf_buffer = io.BytesIO()
+        pdf_writer.write(single_page_pdf_buffer)
+        single_page_pdf_buffer.seek(0)
+        pdf_page_bytes_for_ai = single_page_pdf_buffer.read()
+
+        # --- 2. Gemini API Call ---
+        if not gemini_model: # Assuming gemini_model is accessible (e.g., global or passed)
+            print(f"Task - Gemini model not initialized for page ID {page_id}. Skipping AI call.")
+            return {"page_id": page_id, "status": "error", "message": "Gemini model not initialized"}
+
+        prompt = """You are Expert in reading complex documents.
+        Task for you: Extract the information from the document, You need to convert physical document into a digital verion which imitates the physical form , keep information prefilled and editable.Rememeber the accuracy of the information extracted specially filled information is absolutely important.You need to take care of multilingual , checkboxes and handwritten complexity within document. give me the html with good stylinng for review, if you are not confident on any field or section enough mark that area as red so that Human can rectify that easily. The output should be the html page content without suffix or prefix."""
+        pdf_blob = {
+            'mime_type': 'application/pdf',
+            'data': pdf_page_bytes_for_ai
+        }
+
+        print(f"Task - Calling Gemini for page ID {page_id}, page number {page_number}...")
+        # Ensure gemini_model is the actual initialized model client
+        ai_response = await gemini_model.generate_content_async([prompt, pdf_blob])
+
+        html_content = None
+        if ai_response.parts:
+            html_content = ai_response.text
+            if html_content.startswith("```html"):
+                html_content = html_content[7:]
+            if html_content.startswith("```"):
+                html_content = html_content[3:]
+            if html_content.endswith("```"):
+                html_content = html_content[:-3]
+            html_content = html_content.strip()
+        else:
+            error_detail = "AI model did not return expected content."
+            if ai_response.prompt_feedback and ai_response.prompt_feedback.block_reason:
+                error_detail += f" Reason: {ai_response.prompt_feedback.block_reason_message or ai_response.prompt_feedback.block_reason}"
+            print(f"Task - Error generating HTML for page ID {page_id}: {error_detail}")
+            return {"page_id": page_id, "status": "error", "message": error_detail}
+
+        # --- 3. Database Update ---
+        if html_content:
+            page_to_update = db_task_session.query(models.Page).filter(models.Page.id == page_id).first()
+            if page_to_update:
+                page_to_update.generated_form_html = html_content
+                db_task_session.commit()
+                print(f"Task - Successfully generated and saved HTML for page ID {page_id}.")
+                return {"page_id": page_id, "status": "success"}
+            else:
+                # This case should ideally not happen if page_id is valid
+                print(f"Task - Page ID {page_id} not found in DB for update.")
+                return {"page_id": page_id, "status": "error", "message": "Page not found in DB for update"}
+        
+        # Should have returned earlier if html_content was None due to AI error
+        return {"page_id": page_id, "status": "error", "message": "Unknown error before DB update"}
+
+    except Exception as e_page:
+        db_task_session.rollback()
+        print(f"Task - Exception processing page ID {page_id}: {str(e_page)}")
+        return {"page_id": page_id, "status": "exception", "message": str(e_page)}
+    finally:
+        db_task_session.close()
+
+
+async def generate_html_for_document_pages_parallel(document_id: int, proposal_id: int): # proposal_id still unused
+    # This main function will manage fetching initial doc/page data with one session
+    # but each concurrent task will use its own session for its specific update.
+    db_main = SessionLocal()
+    try:
+        doc = db_main.query(models.Document).filter(models.Document.id == document_id).first()
+        if not doc or not doc.pdf_file:
+            print(f"Main Task: Document {document_id} or its PDF file not found.")
+            return
+
+        # Fetch all page models/metadata at once
+        pages_models_to_process = db_main.query(models.Page).filter(models.Page.document_id == document_id).all()
+        if not pages_models_to_process:
+            print(f"Main Task: No pages found for document {document_id}.")
+            return
+
+        print(f"Main Task: Starting HTML generation for document {document_id}, {len(pages_models_to_process)} pages in parallel.")
+
+        # Store the PDF bytes in memory to pass to each task
+        # This avoids each task trying to access doc.pdf_file which might involve lazy loading issues
+        # or repeated reads if it's not just a simple byte array in the 'doc' object.
+        document_pdf_bytes = doc.pdf_file # Assuming doc.pdf_file holds the raw bytes
+
+        tasks = []
+        for page_model in pages_models_to_process:
+            if page_model.generated_form_html: # Skip if already generated
+                print(f"Main Task: HTML already exists for page {page_model.page_number} (ID: {page_model.id}). Skipping.")
+                continue
+            
+            # Create a task for each page
+            tasks.append(
+                process_single_page_concurrently(
+                    page_id=page_model.id,
+                    page_number=page_model.page_number,
+                    document_pdf_bytes=document_pdf_bytes
+                    # gemini_model_instance=gemini_model # if needed to pass explicitly
+                )
+            )
+
+        if not tasks:
+            print(f"Main Task: No pages require processing for document {document_id}.")
+            return
+
+        # Run all tasks concurrently and wait for them to complete
+        # return_exceptions=True ensures that if one task fails, others continue,
+        # and exceptions are returned as results instead of stopping asyncio.gather.
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        for result in results:
+            if isinstance(result, Exception): # An unexpected error in a task not caught by its own try/except
+                print(f"Main Task: A page processing task failed with an unhandled exception: {result}")
+            elif isinstance(result, dict): # Expected dictionary from process_single_page_concurrently
+                print(f"Main Task: Result for page ID {result.get('page_id')}: {result.get('status')}, Message: {result.get('message', '')}")
+            else:
+                print(f"Main Task: Received an unexpected result type from a page task: {result}")
+
+
+        print(f"Main Task: Finished parallel HTML generation attempt for document {document_id}.")
+
+    except Exception as e_doc:
+        # db_main.rollback() # Not strictly necessary here as db_main is read-only in this revised structure
+        print(f"Main Task: General error for document {document_id}: {str(e_doc)}")
+    finally:
+        db_main.close()
 @app.get("/proposals/{proposal_id}/documents/{document_id}/pages/{page_number}/html", response_model=models.GeneratedHtmlResponse)
 async def get_document_page_html(
     proposal_id: int,
@@ -733,7 +888,7 @@ async def perform_signature_analysis(proposal_id: int): # Removed db_bg: Session
                 "document_name": document_fetch.file_name,
                 "page_number": page_fetch.page_number,
                 "textract_bounding_box": json.loads(sig_instance.bounding_box_json) if isinstance(sig_instance.bounding_box_json, str) else sig_instance.bounding_box_json,
-                "signature_image_url": f"http://localhost:8081/proposals/{proposal_id}/signatures/{sig_instance.id}/image",
+                "signature_image_url": f"http://localhost:8000/proposals/{proposal_id}/signatures/{sig_instance.id}/image",
                 # Add other relevant parts of textract_response_json if needed
             })
 
@@ -746,7 +901,7 @@ async def perform_signature_analysis(proposal_id: int): # Removed db_bg: Session
         docData = []
 
         for doc in document_fetch:
-            docUrls.append("http://localhost:8081/proposals/"+str(doc.project_id)+"/documents/"+str(doc.id)+"/pdf")
+            docUrls.append("http://localhost:8000/proposals/"+str(doc.project_id)+"/documents/"+str(doc.id)+"/pdf")
 
 
         print(docUrls)
